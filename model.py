@@ -10,10 +10,34 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from dataset import end_token
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+from enum import Enum
+class PositionEmbedding(Enum):
+    ABS_LEARNED = 1
+    SINUSODIAL = 2
+    TOKEN_ROTARY = 3
+    QK_ROTARY = 4
+    CUSTOM_PID = 5
+    ROPE_2D = 6
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    pe: PositionEmbedding = PositionEmbedding.ABS_LEARNED
+    width: int = 10
+    height: int = 10
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -26,9 +50,131 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+def get_position_id(config: GPTConfig):
+    pos_h = torch.arange(1, config.height + 1).repeat_interleave(config.width + 1)
+    pos_w = torch.arange(1, config.width + 2).repeat(config.height)
+    pos_h = torch.cat([torch.tensor([0], device=pos_h.device), pos_h])
+    pos_w = torch.cat([torch.tensor([0], device=pos_w.device), pos_w])
+    config.block_size = 1 + config.height * (config.width + 1)
+    return pos_w, pos_h
+
+
+def apply_rope(x, cos, sin):
+    # x: (B, H, T, D)
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    return torch.cat([x1 * cos - x2 * sin,
+                      x1 * sin + x2 * cos], dim=-1)
+
+def build_rope_cache(max_pos, head_dim, device):
+    theta = 10000 ** (-torch.arange(0, head_dim, 2, device=device).float() / head_dim)
+    t = torch.arange(max_pos, device=device).float()[:, None]  # (T,1)
+    freqs = t * theta[None, :]
+    cos = torch.cos(freqs)[None, None, :, :]  # (1,1,T,head_dim/2)
+    sin = torch.sin(freqs)[None, None, :, :]
+    return cos, sin
+
+# ------------------------------
+# 2. Causal Self-Attention with 2D RoPE
+# ------------------------------
+class CausalSelfAttention2DRoPE(nn.Module):
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+
+        self.n_head = config.n_head
+        self.head_dim = config.n_embd // config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            self.register_buffer("bias",
+                torch.tril(torch.ones(config.block_size, config.block_size))
+                .view(1, 1, config.block_size, config.block_size)
+            )
+
+        # Build 2D RoPE tables
+        half_dim = self.head_dim // 2
+        max_x = config.width + 2
+        max_y = config.height + 1
+        
+        cos_x, sin_x = build_rope_cache(max_x, half_dim, device='cpu')
+        cos_y, sin_y = build_rope_cache(max_y, half_dim, device='cpu')
+        pos_x, pos_y = get_position_id(config)
+
+        self.register_buffer("pos_x", pos_x)
+        self.register_buffer("pos_y", pos_y)
+        self.register_buffer("cos_x", cos_x)
+        self.register_buffer("sin_x", sin_x)
+        self.register_buffer("cos_y", cos_y)
+        self.register_buffer("sin_y", sin_y)
+
+    def forward(self, x):
+        """
+        x: (B, T, C)
+        x_pos, y_pos: (B, T) - integer positions in [0, max_x/y)
+        """
+        B, T, C = x.size()
+        x_pos = self.pos_x[:T]
+        y_pos = self.pos_y[:T]
+
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B,H,T,D)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        # --- Apply 2D RoPE ---
+        D = self.head_dim
+        D2 = D // 2
+        qx, qy = q[..., :D2], q[..., D2:]
+        kx, ky = k[..., :D2], k[..., D2:]
+
+        cos_x = self.cos_x[..., x_pos, :]  # (1,1,T,D2/2)
+        sin_x = self.sin_x[..., x_pos, :]
+        cos_y = self.cos_y[..., y_pos, :]
+        sin_y = self.sin_y[..., y_pos, :]
+
+        qx = apply_rope(qx, cos_x, sin_x)
+        kx = apply_rope(kx, cos_x, sin_x)
+        qy = apply_rope(qy, cos_y, sin_y)
+        ky = apply_rope(ky, cos_y, sin_y)
+
+        q = torch.cat([qx, qy], dim=-1)
+        k = torch.cat([kx, ky], dim=-1)
+
+        # --- Attention ---
+        if self.flash:
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=True
+            )
+        else:
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
+
+
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
@@ -93,10 +239,13 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        if config.pe == PositionEmbedding.ROPE_2D:
+            self.attn = CausalSelfAttention2DRoPE(config)
+        else:
+            self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -105,31 +254,58 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        
+        if config.pe == PositionEmbedding.ABS_LEARNED:
+            self.transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                wpe = nn.Embedding(config.block_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ))
+        elif config.pe == PositionEmbedding.SINUSODIAL:
+            pe = torch.zeros(config.block_size, config.n_embd)
+            position = torch.arange(0, config.block_size, dtype=torch.float).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, config.n_embd, 2).float() *
+                                 (-math.log(10000.0) / config.n_embd))
+            pe[:, 0::2] = torch.sin(position * div_term)      # even
+            pe[:, 1::2] = torch.cos(position * div_term)      # odd
+            self.register_buffer('sinusoidal_pe', pe)         # (block_size, n_embd)
+            self.transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ))
+        elif config.pe == PositionEmbedding.CUSTOM_PID:
+            self.transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                wpe_w = nn.Embedding(config.width + 2, config.n_embd),
+                wpe_h = nn.Embedding(config.height + 1, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ))
+            
+            self.pos_w, self.pos_h = get_position_id(self.config)
+        
+        elif config.pe == PositionEmbedding.ROPE_2D:
+            self.config.block_size = 1 + config.height * (config.width + 1)
+            self.transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ))
+        
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -155,7 +331,7 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and self.config.pe == PositionEmbedding.ABS_LEARNED:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -175,8 +351,24 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+
+        if self.config.pe == PositionEmbedding.ABS_LEARNED:
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            in_emb = pos_emb + tok_emb
+        elif self.config.pe == PositionEmbedding.SINUSODIAL:
+            pos_emb = self.sinusoidal_pe[:t, :].unsqueeze(0)
+            in_emb = pos_emb + tok_emb
+        elif self.config.pe == PositionEmbedding.CUSTOM_PID:
+            pos_h = self.pos_h[:t].to(device)
+            pos_w = self.pos_w[:t].to(device)
+            pos_emb_h = self.transformer.wpe_h(pos_h)
+            pos_emb_w = self.transformer.wpe_w(pos_w)
+            pos_emb = pos_emb_h + pos_emb_w
+            in_emb = pos_emb + tok_emb
+        elif self.config.pe == PositionEmbedding.ROPE_2D:
+            in_emb = tok_emb
+
+        x = self.transformer.drop(in_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -184,7 +376,8 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # print(f"logits: {logits.shape}")
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -198,7 +391,8 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        if hasattr(self.transformer, 'wpe'):
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]

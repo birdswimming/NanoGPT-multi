@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, PositionEmbedding
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -35,7 +35,7 @@ from model import GPTConfig, GPT
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
-eval_iters = 200
+eval_iters = 20
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -55,7 +55,7 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+learning_rate = 6e-5 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -65,7 +65,7 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+min_lr = 6e-6 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -112,17 +112,87 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+# data_dir = os.path.join('data', dataset)
+# def get_batch(split):
+#     # We recreate np.memmap every batch to avoid a memory leak, as per
+#     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+#     if split == 'train':
+#         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+#     else:
+#         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+#     ix = torch.randint(len(data) - block_size, (batch_size,))
+#     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+#     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+#     if device_type == 'cuda':
+#         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+#         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+#     else:
+#         x, y = x.to(device), y.to(device)
+#     return x, y
+width = 20
+height = 20
+
+
+from dataset import VerticalMultiplicationDataset
+from torch.utils.data import DataLoader
+train_dataset = VerticalMultiplicationDataset(
+    length=10000000000, 
+    seed=42, 
+    width=width, 
+    height=height, 
+    min_num_len_1=1,
+    max_num_len_1=5,
+    min_num_len_2=1,
+    max_num_len_2=5,
+    with_add=True,
+    for_test=False
+)
+# dataset = VerticalMultiplicationDataset(1000000, 42, 20, 30, 5, with_add=True)
+train_dataloader = DataLoader(
+    train_dataset,
+    batch_size=batch_size,       # 每批次样本数
+    shuffle=False,        # 是否打乱数据
+    num_workers=1,       # 加载数据的线程数
+    pin_memory=True,     # 若使用GPU可提升速度
+)
+train_dataloader_iter = iter(train_dataloader)
+
+test_dataset = VerticalMultiplicationDataset(
+    length=10000000000, 
+    seed=36, 
+    width=width, 
+    height=height, 
+    min_num_len_1=5,
+    max_num_len_1=7,
+    min_num_len_2=5,
+    max_num_len_2=7,
+    with_add=True,
+    for_test=False
+)
+# dataset = VerticalMultiplicationDataset(1000000, 42, 20, 30, 5, with_add=True)
+test_dataloader = DataLoader(
+    test_dataset,
+    batch_size=batch_size,       # 每批次样本数
+    shuffle=False,        # 是否打乱数据
+    num_workers=1,       # 加载数据的线程数
+    pin_memory=True,     # 若使用GPU可提升速度
+)
+test_dataloader_iter = iter(test_dataloader)
+
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    # if split == 'train':
+    #     data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    # else:
+    #     data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        data = next(train_dataloader_iter)
+    elif split == 'val':
+        data = next(test_dataloader_iter)
+    x:torch.Tensor = data["inputs"]
+    y:torch.Tensor = data["labels"]
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -130,29 +200,20 @@ def get_batch(split):
         x, y = x.to(device), y.to(device)
     return x, y
 
+
+
+
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
 
-# attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, pe = PositionEmbedding.ROPE_2D,
+                  bias=bias, vocab_size=None, dropout=dropout, width=width, height=height) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    model_args['vocab_size'] = 15
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
@@ -219,7 +280,9 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
+            # print(f'eval {split} loss of iter {k}')
             X, Y = get_batch(split)
+            # print("X", X.shape)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
@@ -252,17 +315,20 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+log_path = os.path.join(out_dir, 'log.txt')
+log_file = open(log_path, 'a')
 while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}", file=log_file)
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -283,6 +349,7 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
+                print(f"saving checkpoint to {out_dir}", file=log_file)
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
@@ -290,9 +357,9 @@ while True:
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        print()
-        print(f"X: {X.shape}")
-        print(f"Y: {Y.shape}")
+        # print()
+        # print(f"X: {X.shape}")
+        # print(f"Y: {Y.shape}")
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
             # the official way to do this is with model.no_sync() context manager, but
@@ -327,7 +394,9 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, lr {lr:.8f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, lr {lr:.8f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%", file=log_file)
+        log_file.flush()
     iter_num += 1
     local_iter_num += 1
 
